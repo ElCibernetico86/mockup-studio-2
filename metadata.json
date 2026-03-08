@@ -1,0 +1,5 @@
+{
+  "name": "Mockup Studio 2",
+  "description": "An application to automatically create product mockups. Upload your base mockup images (e.g., t-shirts, mugs), then upload your design (PNG). The app will automatically place your design onto each mockup.",
+  "requestFramePermissions": []
+}
