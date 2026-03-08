@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mockup Studio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <style>
+      body {
+        font-family: 'Inter', sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        background-color: #0F172A; /* slate-900 */
+        background-image: radial-gradient(circle at 50% 0%, rgba(30, 64, 175, 0.2) 0%, rgba(15, 23, 42, 0) 60%);
+        background-repeat: no-repeat;
+      }
+      /* Custom styles for range input to match new theme */
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        margin-top: -6px; /* Align thumb with track */
+        width: 18px;
+        height: 18px;
+        background: #3b82f6; /* blue-500 */
+        cursor: pointer;
+        border-radius: 9999px;
+        border: 3px solid white;
+      }
+      input[type="range"]::-moz-range-thumb {
+        width: 18px;
+        height: 18px;
+        background: #3b82f6; /* blue-500 */
+        cursor: pointer;
+        border-radius: 9999px;
+        border: 3px solid white;
+      }
+    </style>
+
+<link rel="stylesheet" href="/index.css">
+  <script type="importmap">
+{
+  "imports": {
+    "react": "https://aistudiocdn.com/react@^19.1.1",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.1.1/",
+    "react/": "https://aistudiocdn.com/react@^19.1.1/"
+  }
+}
+</script>
+  <script type="module" crossorigin src="/mockup-studio-2/assets/index-C9iaIFG4.js"></script>
+</head>
+  <body class="text-slate-200">
+    <div id="root"></div>
+  </body>
+</html>
