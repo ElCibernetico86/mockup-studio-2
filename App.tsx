@@ -1,12 +1,66 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import JSZip from 'jszip';
 import { Header } from './components/Header';
 import { ImageUploader } from './components/ImageUploader';
 import { MockupCard } from './components/MockupCard';
 import { Spinner, InfoIcon, DownloadIcon, SaveIcon, LoadIcon } from './components/icons';
+import { auth, db, storage } from './firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { collection, addDoc, getDocs, query, where, serverTimestamp, doc, setDoc } from 'firebase/firestore';
+import { ref, uploadString, getDownloadURL } from 'firebase/storage';
+import { Cloud, CloudDownload, X } from 'lucide-react';
 
-declare var JSZip: any;
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
 
-const MAX_MOCKUPS = 7;
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 
 // Types for our interactive mockup state
 export interface LogoState {
@@ -50,6 +104,36 @@ const App: React.FC = () => {
   const [isZipping, setIsZipping] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [profilePlacements, setProfilePlacements] = useState<ProfileLogoState[] | null>(null);
+  const interactiveMockupsRef = useRef<MockupState[]>([]);
+  useEffect(() => {
+    interactiveMockupsRef.current = interactiveMockups;
+  }, [interactiveMockups]);
+  const [user, setUser] = useState<User | null>(null);
+  const [isSavingCloud, setIsSavingCloud] = useState(false);
+  const [showCloudModal, setShowCloudModal] = useState(false);
+  const [cloudProfiles, setCloudProfiles] = useState<any[]>([]);
+  const [isLoadingCloud, setIsLoadingCloud] = useState(false);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      if (currentUser) {
+        // Ensure user document exists
+        try {
+          await setDoc(doc(db, 'users', currentUser.uid), {
+            uid: currentUser.uid,
+            email: currentUser.email,
+            displayName: currentUser.displayName,
+            photoURL: currentUser.photoURL,
+            createdAt: serverTimestamp()
+          }, { merge: true });
+        } catch (e) {
+          handleFirestoreError(e, OperationType.WRITE, 'users');
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, []);
 
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
@@ -63,15 +147,11 @@ const App: React.FC = () => {
   const handleMockupsUpload = useCallback(async (files: FileList) => {
     setError(null);
     setProfilePlacements(null);
-    if (files.length > MAX_MOCKUPS) {
-      setError(`You can only upload a maximum of ${MAX_MOCKUPS} mockup images.`);
-      return;
-    }
     const fileArray = Array.from(files);
     const base64Promises = fileArray.map(fileToBase64);
     try {
       const base64Strings = await Promise.all(base64Promises);
-      setMockupImages(base64Strings);
+      setMockupImages(prev => [...prev, ...base64Strings]);
     } catch (err) {
       setError('Failed to read mockup files. Please try again.');
       console.error(err);
@@ -110,16 +190,29 @@ const App: React.FC = () => {
         const logoAspectRatio = logoImg.width / logoImg.height;
   
         const newMockupsPromises = mockupImages.map(async (mockupSrc, index) => {
+            const existing = interactiveMockupsRef.current.find(m => m.mockupSrc === mockupSrc);
+            if (existing && existing.logo.src === logoImage) {
+                return existing;
+            }
+
             if (profilePlacements && profilePlacements[index]) {
                 // Use placement from profile
                 const placement = profilePlacements[index];
+                
+                // Adjust height to preserve the new image's native aspect ratio, preventing distortion
+                const adjustedHeight = placement.width / logoAspectRatio;
+                
                 return {
                     id: `mockup-${index}-${Date.now()}`,
                     mockupSrc,
                     logo: {
                         src: logoImage,
                         aspectRatio: logoAspectRatio,
-                        ...placement
+                        x: placement.x,
+                        y: placement.y,
+                        width: placement.width,
+                        height: adjustedHeight,
+                        opacity: placement.opacity
                     }
                 };
             } else {
@@ -306,6 +399,110 @@ const App: React.FC = () => {
     document.getElementById('profile-loader')?.click();
   }
 
+  const handleSaveToCloud = async () => {
+    if (!user) {
+      setError("You must be signed in to save to the cloud.");
+      return;
+    }
+    if (interactiveMockups.length === 0) {
+      setError("There's nothing to save. Please create some mockups first.");
+      return;
+    }
+
+    setIsSavingCloud(true);
+    setError(null);
+
+    try {
+      const profileName = prompt("Enter a name for this profile:", "My Mockups");
+      if (!profileName) {
+        setIsSavingCloud(false);
+        return;
+      }
+
+      const uploadImageAndGetURL = async (base64Str: string, path: string) => {
+         if (base64Str.startsWith('http')) return base64Str;
+         const imageRef = ref(storage, path);
+         await uploadString(imageRef, base64Str, 'data_url');
+         return await getDownloadURL(imageRef);
+      };
+
+      const uniqueId = Date.now().toString();
+
+      const processedMockupsPromises = interactiveMockups.map(async (m, i) => {
+         let bgUrl = m.mockupSrc;
+         if (bgUrl.startsWith('data:')) {
+             bgUrl = await uploadImageAndGetURL(bgUrl, `users/${user.uid}/mockups/${uniqueId}_${i}.png`);
+         }
+         return {
+            mockupSrc: bgUrl,
+            logo: {
+               x: m.logo.x,
+               y: m.logo.y,
+               width: m.logo.width,
+               height: m.logo.height,
+               opacity: m.logo.opacity,
+            }
+         };
+      });
+
+      const processedMockups = await Promise.all(processedMockupsPromises);
+
+      const profileData = {
+        userId: user.uid,
+        name: profileName,
+        mockups: processedMockups,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      };
+
+      await addDoc(collection(db, 'profiles'), profileData);
+      alert("Profile saved to cloud successfully!");
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'profiles');
+    } finally {
+      setIsSavingCloud(false);
+    }
+  };
+
+  const fetchCloudProfiles = async () => {
+    if (!user) return;
+    setIsLoadingCloud(true);
+    setError(null);
+    try {
+      const q = query(collection(db, 'profiles'), where('userId', '==', user.uid));
+      const querySnapshot = await getDocs(q);
+      const profiles: any[] = [];
+      querySnapshot.forEach((doc) => {
+        profiles.push({ id: doc.id, ...doc.data() });
+      });
+      setCloudProfiles(profiles);
+      setShowCloudModal(true);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'profiles');
+    } finally {
+      setIsLoadingCloud(false);
+    }
+  };
+
+  const loadCloudProfile = (profile: any) => {
+    try {
+      if (!profile.mockups || !Array.isArray(profile.mockups)) {
+        throw new Error("Invalid profile format.");
+      }
+
+      const loadedMockupImages = profile.mockups.map((m: any) => m.mockupSrc);
+      const loadedPlacements = profile.mockups.map((m: any) => m.logo);
+      
+      setMockupImages(loadedMockupImages);
+      setProfilePlacements(loadedPlacements);
+      setLogoImage(null);
+      setInteractiveMockups([]);
+      setShowCloudModal(false);
+    } catch (err) {
+      console.error("Error loading profile:", err);
+      setError("Failed to load the selected profile.");
+    }
+  };
 
   return (
     <div className="min-h-screen font-sans">
@@ -326,23 +523,35 @@ const App: React.FC = () => {
                 <span className="text-3xl font-black text-slate-600 mr-2">1</span>
                 Upload Mockup Images
                 </h2>
-                <button
-                    onClick={triggerProfileLoad}
-                    className="flex items-center gap-2 text-sm bg-slate-700/50 text-slate-300 font-semibold py-1.5 px-3 rounded-lg hover:bg-slate-700 transition-colors"
-                    title="Load a saved profile"
-                >
-                    <LoadIcon />
-                    <span>Load Profile</span>
-                </button>
+                <div className="flex gap-2">
+                  {user && (
+                    <button
+                        onClick={fetchCloudProfiles}
+                        disabled={isLoadingCloud}
+                        className="flex items-center gap-2 text-sm bg-blue-600/20 text-blue-400 font-semibold py-1.5 px-3 rounded-lg hover:bg-blue-600/30 transition-colors"
+                        title="Load from Cloud"
+                    >
+                        {isLoadingCloud ? <Spinner className="w-4 h-4" /> : <CloudDownload size={16} />}
+                        <span>Cloud</span>
+                    </button>
+                  )}
+                  <button
+                      onClick={triggerProfileLoad}
+                      className="flex items-center gap-2 text-sm bg-slate-700/50 text-slate-300 font-semibold py-1.5 px-3 rounded-lg hover:bg-slate-700 transition-colors"
+                      title="Load a saved profile"
+                  >
+                      <LoadIcon />
+                      <span>Local</span>
+                  </button>
+                </div>
                 <input type="file" id="profile-loader" accept=".json" className="hidden" onChange={handleLoadProfile} />
             </div>
 
-            <p className="text-slate-400 mb-4">Select up to {MAX_MOCKUPS} images (e.g., t-shirts, mugs).</p>
+            <p className="text-slate-400 mb-4">Select mockup images (e.g., t-shirts, mugs).</p>
             <ImageUploader 
               onUpload={handleMockupsUpload} 
               multiple={true} 
               accept="image/jpeg, image/png, image/webp"
-              maxFiles={MAX_MOCKUPS}
               />
           </div>
           <div className="bg-slate-800/40 backdrop-blur-lg p-6 rounded-2xl shadow-2xl border border-slate-700/80">
@@ -370,13 +579,23 @@ const App: React.FC = () => {
                         <p className="text-slate-400">Click a mockup to select. Then drag, resize, and adjust the logo.</p>
                     </div>
                     {!isLoading && interactiveMockups.length > 0 && (
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-3 flex-wrap">
+                            {user && (
+                              <button
+                                  onClick={handleSaveToCloud}
+                                  disabled={isSavingCloud}
+                                  className="flex-shrink-0 flex items-center gap-2 bg-blue-600/20 text-blue-400 border border-blue-500/30 font-bold py-2 px-4 rounded-lg shadow-md hover:bg-blue-600/30 transition-all duration-300"
+                              >
+                                  {isSavingCloud ? <Spinner className="w-5 h-5" /> : <Cloud size={20} />}
+                                  <span>Save to Cloud</span>
+                              </button>
+                            )}
                             <button
                                 onClick={handleSaveProfile}
                                 className="flex-shrink-0 flex items-center gap-2 bg-slate-700/50 text-slate-200 font-bold py-2 px-4 rounded-lg shadow-md hover:bg-slate-700 transition-all duration-300"
                             >
                                 <SaveIcon />
-                                <span>Save Profile</span>
+                                <span>Save Local</span>
                             </button>
                             <button
                                 onClick={handleDownloadAll}
@@ -428,6 +647,45 @@ const App: React.FC = () => {
                 <InfoIcon />
                 <p className="font-semibold">{profilePlacements ? 'Profile loaded. Now upload your new design!' : 'Your mockup images are ready. Now upload your design!'}</p>
             </div>
+        )}
+
+        {showCloudModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm">
+            <div className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+              <div className="flex justify-between items-center p-4 border-b border-slate-700">
+                <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                  <CloudDownload className="text-blue-400" />
+                  Load from Cloud
+                </h3>
+                <button onClick={() => setShowCloudModal(false)} className="text-slate-400 hover:text-white transition-colors">
+                  <X size={24} />
+                </button>
+              </div>
+              <div className="p-4 max-h-96 overflow-y-auto">
+                {cloudProfiles.length === 0 ? (
+                  <p className="text-slate-400 text-center py-8">No saved profiles found.</p>
+                ) : (
+                  <div className="space-y-3">
+                    {cloudProfiles.map(profile => (
+                      <button
+                        key={profile.id}
+                        onClick={() => loadCloudProfile(profile)}
+                        className="w-full text-left p-4 rounded-xl bg-slate-700/30 hover:bg-slate-700/60 border border-slate-600/50 transition-colors flex justify-between items-center group"
+                      >
+                        <div>
+                          <p className="font-bold text-slate-200 group-hover:text-blue-400 transition-colors">{profile.name}</p>
+                          <p className="text-xs text-slate-400 mt-1">
+                            {profile.mockups?.length || 0} mockups • {profile.createdAt?.toDate ? new Date(profile.createdAt.toDate()).toLocaleDateString() : 'Unknown date'}
+                          </p>
+                        </div>
+                        <CloudDownload size={18} className="text-slate-500 group-hover:text-blue-400" />
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
         )}
       </main>
     </div>

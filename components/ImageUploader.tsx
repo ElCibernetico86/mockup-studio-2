@@ -5,10 +5,9 @@ interface ImageUploaderProps {
   onUpload: (files: FileList) => void;
   multiple: boolean;
   accept: string;
-  maxFiles?: number;
 }
 
-export const ImageUploader: React.FC<ImageUploaderProps> = ({ onUpload, multiple, accept, maxFiles }) => {
+export const ImageUploader: React.FC<ImageUploaderProps> = ({ onUpload, multiple, accept }) => {
   const [previews, setPreviews] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -23,7 +22,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ onUpload, multiple
   const handleFiles = (files: FileList) => {
     onUpload(files);
     const previewUrls = Array.from(files).map(file => URL.createObjectURL(file));
-    setPreviews(previewUrls);
+    setPreviews(prev => multiple ? [...prev, ...previewUrls] : previewUrls);
   };
   
   const handleDragEnter = useCallback((e: React.DragEvent<HTMLLabelElement>) => {
@@ -71,7 +70,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ onUpload, multiple
             <p className="mt-2 text-sm text-slate-400">
                 <span className="font-semibold text-blue-400">Click to upload</span> or drag and drop
             </p>
-            <p className="text-xs text-slate-500">{multiple ? `Up to ${maxFiles} images` : 'PNG format'}</p>
+            <p className="text-xs text-slate-500">{multiple ? 'Multiple images' : 'PNG format'}</p>
             </div>
             <input
             ref={fileInputRef}
