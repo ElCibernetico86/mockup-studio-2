@@ -6,9 +6,9 @@ import { MockupCard } from './components/MockupCard';
 import { Spinner, InfoIcon, DownloadIcon, SaveIcon, LoadIcon } from './components/icons';
 import { auth, db, storage } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { collection, addDoc, getDocs, query, where, serverTimestamp, doc, setDoc } from 'firebase/firestore';
+import { collection, addDoc, getDocs, query, where, serverTimestamp, doc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { ref, uploadString, getDownloadURL } from 'firebase/storage';
-import { Cloud, CloudDownload, X } from 'lucide-react';
+import { Cloud, CloudDownload, Pencil, Trash2, X } from 'lucide-react';
 
 enum OperationType {
   CREATE = 'create',
@@ -94,6 +94,18 @@ interface Profile {
     mockups: ProfileMockup[];
 }
 
+interface CloudProfile extends Profile {
+    id: string;
+    userId: string;
+    name: string;
+    createdAt?: {
+      toDate?: () => Date;
+    };
+    updatedAt?: {
+      toDate?: () => Date;
+    };
+}
+
 
 const App: React.FC = () => {
   const [mockupImages, setMockupImages] = useState<string[]>([]);
@@ -111,8 +123,9 @@ const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [isSavingCloud, setIsSavingCloud] = useState(false);
   const [showCloudModal, setShowCloudModal] = useState(false);
-  const [cloudProfiles, setCloudProfiles] = useState<any[]>([]);
+  const [cloudProfiles, setCloudProfiles] = useState<CloudProfile[]>([]);
   const [isLoadingCloud, setIsLoadingCloud] = useState(false);
+  const [busyCloudProfileId, setBusyCloudProfileId] = useState<string | null>(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
@@ -471,9 +484,9 @@ const App: React.FC = () => {
     try {
       const q = query(collection(db, 'profiles'), where('userId', '==', user.uid));
       const querySnapshot = await getDocs(q);
-      const profiles: any[] = [];
+      const profiles: CloudProfile[] = [];
       querySnapshot.forEach((doc) => {
-        profiles.push({ id: doc.id, ...doc.data() });
+        profiles.push({ id: doc.id, ...doc.data() } as CloudProfile);
       });
       setCloudProfiles(profiles);
       setShowCloudModal(true);
@@ -484,7 +497,7 @@ const App: React.FC = () => {
     }
   };
 
-  const loadCloudProfile = (profile: any) => {
+  const loadCloudProfile = (profile: CloudProfile) => {
     try {
       if (!profile.mockups || !Array.isArray(profile.mockups)) {
         throw new Error("Invalid profile format.");
@@ -501,6 +514,54 @@ const App: React.FC = () => {
     } catch (err) {
       console.error("Error loading profile:", err);
       setError("Failed to load the selected profile.");
+    }
+  };
+
+  const renameCloudProfile = async (profile: CloudProfile) => {
+    if (!user || busyCloudProfileId) return;
+
+    const newName = prompt("Enter a new name for this profile:", profile.name)?.trim();
+    if (!newName || newName === profile.name) return;
+
+    setBusyCloudProfileId(profile.id);
+    setError(null);
+
+    try {
+      await updateDoc(doc(db, 'profiles', profile.id), {
+        name: newName,
+        updatedAt: serverTimestamp()
+      });
+
+      setCloudProfiles(prev =>
+        prev.map(item =>
+          item.id === profile.id ? { ...item, name: newName } : item
+        )
+      );
+    } catch (err) {
+      console.error("Error renaming cloud profile:", err);
+      setError("Failed to rename the cloud profile. Please try again.");
+    } finally {
+      setBusyCloudProfileId(null);
+    }
+  };
+
+  const deleteCloudProfile = async (profile: CloudProfile) => {
+    if (!user || busyCloudProfileId) return;
+
+    const confirmed = confirm(`Delete "${profile.name}" from the cloud? This cannot be undone.`);
+    if (!confirmed) return;
+
+    setBusyCloudProfileId(profile.id);
+    setError(null);
+
+    try {
+      await deleteDoc(doc(db, 'profiles', profile.id));
+      setCloudProfiles(prev => prev.filter(item => item.id !== profile.id));
+    } catch (err) {
+      console.error("Error deleting cloud profile:", err);
+      setError("Failed to delete the cloud profile. Please try again.");
+    } finally {
+      setBusyCloudProfileId(null);
     }
   };
 
@@ -666,21 +727,57 @@ const App: React.FC = () => {
                   <p className="text-slate-400 text-center py-8">No saved profiles found.</p>
                 ) : (
                   <div className="space-y-3">
-                    {cloudProfiles.map(profile => (
-                      <button
-                        key={profile.id}
-                        onClick={() => loadCloudProfile(profile)}
-                        className="w-full text-left p-4 rounded-xl bg-slate-700/30 hover:bg-slate-700/60 border border-slate-600/50 transition-colors flex justify-between items-center group"
-                      >
-                        <div>
-                          <p className="font-bold text-slate-200 group-hover:text-blue-400 transition-colors">{profile.name}</p>
-                          <p className="text-xs text-slate-400 mt-1">
-                            {profile.mockups?.length || 0} mockups • {profile.createdAt?.toDate ? new Date(profile.createdAt.toDate()).toLocaleDateString() : 'Unknown date'}
-                          </p>
+                    {cloudProfiles.map(profile => {
+                      const isBusy = busyCloudProfileId === profile.id;
+
+                      return (
+                        <div
+                          key={profile.id}
+                          className="w-full p-4 rounded-xl bg-slate-700/30 border border-slate-600/50 flex justify-between items-center gap-3"
+                        >
+                          <button
+                            onClick={() => loadCloudProfile(profile)}
+                            disabled={isBusy}
+                            className="min-w-0 flex-1 text-left group disabled:cursor-wait"
+                            title={`Load ${profile.name}`}
+                          >
+                            <p className="font-bold text-slate-200 group-hover:text-blue-400 transition-colors truncate">{profile.name}</p>
+                            <p className="text-xs text-slate-400 mt-1">
+                              {profile.mockups?.length || 0} mockups • {profile.createdAt?.toDate ? new Date(profile.createdAt.toDate()).toLocaleDateString() : 'Unknown date'}
+                            </p>
+                          </button>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              onClick={() => loadCloudProfile(profile)}
+                              disabled={isBusy}
+                              className="p-2 rounded-lg text-slate-400 hover:text-blue-300 hover:bg-blue-500/10 transition-colors disabled:opacity-50 disabled:cursor-wait"
+                              title="Load profile"
+                              aria-label={`Load ${profile.name}`}
+                            >
+                              <CloudDownload size={18} />
+                            </button>
+                            <button
+                              onClick={() => renameCloudProfile(profile)}
+                              disabled={isBusy}
+                              className="p-2 rounded-lg text-slate-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors disabled:opacity-50 disabled:cursor-wait"
+                              title="Rename profile"
+                              aria-label={`Rename ${profile.name}`}
+                            >
+                              {isBusy ? <Spinner className="w-4 h-4" /> : <Pencil size={18} />}
+                            </button>
+                            <button
+                              onClick={() => deleteCloudProfile(profile)}
+                              disabled={isBusy}
+                              className="p-2 rounded-lg text-slate-400 hover:text-red-300 hover:bg-red-500/10 transition-colors disabled:opacity-50 disabled:cursor-wait"
+                              title="Delete profile"
+                              aria-label={`Delete ${profile.name}`}
+                            >
+                              <Trash2 size={18} />
+                            </button>
+                          </div>
                         </div>
-                        <CloudDownload size={18} className="text-slate-500 group-hover:text-blue-400" />
-                      </button>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
