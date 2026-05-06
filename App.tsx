@@ -112,8 +112,20 @@ interface LoadedImage {
 }
 
 const EXPORT_SIZE = 2000;
+const REMOTE_IMAGE_TIMEOUT_MS = 45000;
 
 const isRemoteUrl = (src: string) => /^https?:\/\//i.test(src);
+
+const fetchWithTimeout = async (src: string): Promise<Response> => {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), REMOTE_IMAGE_TIMEOUT_MS);
+
+  try {
+    return await fetch(src, { signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+};
 
 const getCanvasSafeImageSource = async (src: string): Promise<{ src: string; cleanup: () => void; crossOrigin?: string }> => {
   if (!isRemoteUrl(src)) {
@@ -121,7 +133,7 @@ const getCanvasSafeImageSource = async (src: string): Promise<{ src: string; cle
   }
 
   try {
-    const response = await fetch(src);
+    const response = await fetchWithTimeout(src);
     if (!response.ok) {
       throw new Error(`Image fetch failed with status ${response.status}`);
     }
@@ -156,11 +168,20 @@ const loadImage = async (src: string, options: { canvasSafe?: boolean } = {}): P
 
   return new Promise((resolve, reject) => {
     const img = new Image();
+    const timeoutId = window.setTimeout(() => {
+      source.cleanup();
+      reject(new Error(`Timed out while loading image: ${src}`));
+    }, REMOTE_IMAGE_TIMEOUT_MS);
+
     if (source.crossOrigin) {
       img.crossOrigin = source.crossOrigin;
     }
-    img.onload = () => resolve({ image: img, cleanup: source.cleanup });
+    img.onload = () => {
+      window.clearTimeout(timeoutId);
+      resolve({ image: img, cleanup: source.cleanup });
+    };
     img.onerror = () => {
+      window.clearTimeout(timeoutId);
       source.cleanup();
       reject(new Error(`Failed to load image: ${src}`));
     };
@@ -203,6 +224,16 @@ const getCoverTransform = (
   };
 };
 
+const triggerDownload = (url: string, fileName: string) => {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
 
 const App: React.FC = () => {
   const [mockupImages, setMockupImages] = useState<string[]>([]);
@@ -211,6 +242,8 @@ const App: React.FC = () => {
   const [selectedMockupId, setSelectedMockupId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isZipping, setIsZipping] = useState<boolean>(false);
+  const [zipProgress, setZipProgress] = useState<string | null>(null);
+  const [zipDownloadUrl, setZipDownloadUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [profilePlacements, setProfilePlacements] = useState<ProfileLogoState[] | null>(null);
   const interactiveMockupsRef = useRef<MockupState[]>([]);
@@ -244,6 +277,14 @@ const App: React.FC = () => {
     });
     return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (zipDownloadUrl) {
+        URL.revokeObjectURL(zipDownloadUrl);
+      }
+    };
+  }, [zipDownloadUrl]);
 
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
@@ -373,12 +414,15 @@ const App: React.FC = () => {
   const handleDownloadAll = async () => {
     if (interactiveMockups.length <= 1) return;
     setIsZipping(true);
+    setZipProgress('Preparing export...');
+    setZipDownloadUrl(null);
     setError(null);
 
     try {
       const zip = new JSZip();
 
-      const imagePromises = interactiveMockups.map(async (mockup, index) => {
+      for (const [index, mockup] of interactiveMockups.entries()) {
+        setZipProgress(`Rendering ${index + 1} of ${interactiveMockups.length}...`);
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         if (!ctx) throw new Error("Could not get canvas context");
@@ -413,27 +457,30 @@ const App: React.FC = () => {
           const pngBlob = await canvasToPngBlob(canvas);
           zip.file(`mockup_${index + 1}.png`, pngBlob);
         } finally {
+          canvas.width = 0;
+          canvas.height = 0;
           loadedMockup.cleanup();
           loadedLogo.cleanup();
         }
+
+        await new Promise(resolve => window.setTimeout(resolve, 0));
+      }
+
+      setZipProgress('Creating ZIP file...');
+      const zipBlob = await zip.generateAsync({ type: 'blob' }, metadata => {
+        setZipProgress(`Creating ZIP file... ${Math.round(metadata.percent)}%`);
       });
-
-      await Promise.all(imagePromises);
-
-      const zipBlob = await zip.generateAsync({ type: 'blob' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(zipBlob);
-      link.download = 'mockups.zip';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(link.href);
+      setZipProgress('Starting download...');
+      const downloadUrl = URL.createObjectURL(zipBlob);
+      setZipDownloadUrl(downloadUrl);
+      triggerDownload(downloadUrl, 'mockups.zip');
 
     } catch (err) {
       console.error("Failed to create zip file", err);
       setError("An error occurred while creating the zip file. Please try again.");
     } finally {
       setIsZipping(false);
+      setZipProgress(null);
     }
   };
   
@@ -770,6 +817,25 @@ const App: React.FC = () => {
                         </div>
                     )}
                 </div>
+
+                {zipProgress && (
+                    <p className="mb-6 text-center sm:text-right text-sm font-medium text-blue-300" role="status" aria-live="polite">
+                        {zipProgress}
+                    </p>
+                )}
+
+                {zipDownloadUrl && !isZipping && (
+                    <div className="mb-6 flex justify-center sm:justify-end">
+                        <a
+                            href={zipDownloadUrl}
+                            download="mockups.zip"
+                            className="inline-flex items-center gap-2 rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-2 text-sm font-bold text-green-300 hover:bg-green-500/20 transition-colors"
+                        >
+                            <DownloadIcon />
+                            <span>Download ready: mockups.zip</span>
+                        </a>
+                    </div>
+                )}
                 
                 {isLoading && (
                     <div className="flex flex-col items-center justify-center p-12 bg-slate-800/40 backdrop-blur-lg rounded-2xl border border-slate-700/80">
