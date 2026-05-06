@@ -7,7 +7,7 @@ import { Spinner, InfoIcon, DownloadIcon, SaveIcon, LoadIcon } from './component
 import { auth, db, storage } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { collection, addDoc, getDocs, query, where, serverTimestamp, doc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
-import { ref, uploadString, getDownloadURL } from 'firebase/storage';
+import { ref, uploadString, getDownloadURL, getBlob } from 'firebase/storage';
 import { Cloud, CloudDownload, Pencil, Trash2, X } from 'lucide-react';
 
 enum OperationType {
@@ -106,6 +106,103 @@ interface CloudProfile extends Profile {
     };
 }
 
+interface LoadedImage {
+  image: HTMLImageElement;
+  cleanup: () => void;
+}
+
+const EXPORT_SIZE = 2000;
+
+const isRemoteUrl = (src: string) => /^https?:\/\//i.test(src);
+
+const getCanvasSafeImageSource = async (src: string): Promise<{ src: string; cleanup: () => void; crossOrigin?: string }> => {
+  if (!isRemoteUrl(src)) {
+    return { src, cleanup: () => {} };
+  }
+
+  try {
+    const response = await fetch(src);
+    if (!response.ok) {
+      throw new Error(`Image fetch failed with status ${response.status}`);
+    }
+
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    return {
+      src: objectUrl,
+      cleanup: () => URL.revokeObjectURL(objectUrl),
+    };
+  } catch (err) {
+    console.warn('Could not fetch remote image directly; trying Firebase Storage SDK instead.', err);
+  }
+
+  try {
+    const blob = await getBlob(ref(storage, src));
+    const objectUrl = URL.createObjectURL(blob);
+    return {
+      src: objectUrl,
+      cleanup: () => URL.revokeObjectURL(objectUrl),
+    };
+  } catch (err) {
+    console.warn('Could not download image through Firebase Storage SDK; trying CORS image load instead.', err);
+    return { src, cleanup: () => {}, crossOrigin: 'anonymous' };
+  }
+};
+
+const loadImage = async (src: string, options: { canvasSafe?: boolean } = {}): Promise<LoadedImage> => {
+  const source = options.canvasSafe
+    ? await getCanvasSafeImageSource(src)
+    : { src, cleanup: () => {}, crossOrigin: undefined };
+
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    if (source.crossOrigin) {
+      img.crossOrigin = source.crossOrigin;
+    }
+    img.onload = () => resolve({ image: img, cleanup: source.cleanup });
+    img.onerror = () => {
+      source.cleanup();
+      reject(new Error(`Failed to load image: ${src}`));
+    };
+    img.src = source.src;
+  });
+};
+
+const canvasToPngBlob = (canvas: HTMLCanvasElement): Promise<Blob> => {
+  return new Promise((resolve, reject) => {
+    try {
+      canvas.toBlob((blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          reject(new Error('Canvas export returned an empty image.'));
+        }
+      }, 'image/png');
+    } catch (err) {
+      reject(err);
+    }
+  });
+};
+
+const getCoverTransform = (
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number
+) => {
+  const scale = Math.max(targetWidth / sourceWidth, targetHeight / sourceHeight);
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
+
+  return {
+    scale,
+    x: (targetWidth - width) / 2,
+    y: (targetHeight - height) / 2,
+    width,
+    height,
+  };
+};
+
 
 const App: React.FC = () => {
   const [mockupImages, setMockupImages] = useState<string[]>([]);
@@ -194,12 +291,7 @@ const App: React.FC = () => {
     
     const processImages = async () => {
       try {
-        const logoImg = await new Promise<HTMLImageElement>((resolve, reject) => {
-          const img = new Image();
-          img.src = logoImage;
-          img.onload = () => resolve(img);
-          img.onerror = () => reject(new Error('Failed to load logo image'));
-        });
+        const { image: logoImg } = await loadImage(logoImage);
         const logoAspectRatio = logoImg.width / logoImg.height;
   
         const newMockupsPromises = mockupImages.map(async (mockupSrc, index) => {
@@ -230,12 +322,7 @@ const App: React.FC = () => {
                 };
             } else {
                 // Calculate default placement
-                const mockupImg = await new Promise<HTMLImageElement>((resolve, reject) => {
-                    const img = new Image();
-                    img.src = mockupSrc;
-                    img.onload = () => resolve(img);
-                    img.onerror = () => reject(new Error('Failed to load mockup image'));
-                });
+                const { image: mockupImg, cleanup } = await loadImage(mockupSrc);
     
                 const maxLogoWidth = mockupImg.width * 0.3;
                 const scale = Math.min(maxLogoWidth / logoImg.width, mockupImg.height * 0.4 / logoImg.height);
@@ -243,6 +330,7 @@ const App: React.FC = () => {
                 const logoHeight = logoImg.height * scale;
                 const logoX = (mockupImg.width - logoWidth) / 2;
                 const logoY = mockupImg.height * 0.2;
+                cleanup();
     
                 return {
                     id: `mockup-${index}-${Date.now()}`,
@@ -299,31 +387,35 @@ const App: React.FC = () => {
         ctx.imageSmoothingEnabled = true;
         (ctx as any).imageSmoothingQuality = 'high';
 
-        const mockupImg = new Image();
-        await new Promise<void>((resolve, reject) => {
-          mockupImg.onload = () => resolve();
-          mockupImg.onerror = reject;
-          mockupImg.src = mockup.mockupSrc;
-        });
+        const loadedMockup = await loadImage(mockup.mockupSrc, { canvasSafe: true });
+        const loadedLogo = await loadImage(mockup.logo.src, { canvasSafe: true });
 
-        canvas.width = mockupImg.naturalWidth;
-        canvas.height = mockupImg.naturalHeight;
-        ctx.drawImage(mockupImg, 0, 0);
+        try {
+          const mockupImg = loadedMockup.image;
+          const logoImg = loadedLogo.image;
+          const mockupWidth = mockupImg.naturalWidth || mockupImg.width;
+          const mockupHeight = mockupImg.naturalHeight || mockupImg.height;
+          const transform = getCoverTransform(mockupWidth, mockupHeight, EXPORT_SIZE, EXPORT_SIZE);
 
-        const logoImg = new Image();
-        await new Promise<void>((resolve, reject) => {
-          logoImg.onload = () => resolve();
-          logoImg.onerror = reject;
-          logoImg.src = mockup.logo.src;
-        });
+          canvas.width = EXPORT_SIZE;
+          canvas.height = EXPORT_SIZE;
+          ctx.drawImage(mockupImg, transform.x, transform.y, transform.width, transform.height);
 
-        ctx.globalAlpha = mockup.logo.opacity;
-        ctx.drawImage(logoImg, mockup.logo.x, mockup.logo.y, mockup.logo.width, mockup.logo.height);
+          ctx.globalAlpha = mockup.logo.opacity;
+          ctx.drawImage(
+            logoImg,
+            mockup.logo.x * transform.scale + transform.x,
+            mockup.logo.y * transform.scale + transform.y,
+            mockup.logo.width * transform.scale,
+            mockup.logo.height * transform.scale
+          );
 
-        const dataUrl = canvas.toDataURL('image/png');
-        const base64Data = dataUrl.substring('data:image/png;base64,'.length);
-        
-        zip.file(`mockup_${index + 1}.png`, base64Data, { base64: true });
+          const pngBlob = await canvasToPngBlob(canvas);
+          zip.file(`mockup_${index + 1}.png`, pngBlob);
+        } finally {
+          loadedMockup.cleanup();
+          loadedLogo.cleanup();
+        }
       });
 
       await Promise.all(imagePromises);
